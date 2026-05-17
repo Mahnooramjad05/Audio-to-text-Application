@@ -4,42 +4,22 @@ _uploads/
 # Python
 __pycache__/
 *.py[cod]
-*.pyo
 *.egg-info/
 .venv/
 venv/
-env/
 .env
-.env.*
-!.env.example
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb_checkpoints
 
-# IDE / Editors
+# IDE
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
 
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# Logs / temp
+# Logs
 *.log
-*.tmp
-*.bak
-
-# ASR model artifacts (download separately, see README)
-vosk-model-*/
-*.zip
-
-# Node / frontend tooling (if added later)
-node_modules/
-dist/
-build/
-.parcel-cache/
