@@ -10,7 +10,7 @@
 [![Vosk](https://img.shields.io/badge/ASR-Vosk-FF6B35)](https://alphacephei.com/vosk/)
 [![Whisper](https://img.shields.io/badge/ASR-Whisper%20(optional)-7C3AED)](https://github.com/openai/whisper)
 [![Claude](https://img.shields.io/badge/LLM-Claude-D97757)](https://www.anthropic.com/)
-[![License](https://img.shields.io/badge/License-MIT-374151)](#)
+[![License](https://img.shields.io/badge/License-MIT-374151)](LICENSE)
 
 <!-- Replace with an architecture banner image at docs/architecture.png when available -->
 <!-- <img src="docs/architecture.png" alt="Pipeline architecture" width="780"/> -->
@@ -55,7 +55,7 @@ The system was built to demonstrate **engineering decisions, not model training*
 |---|---|---|
 | **Ingest** | Decode upload to mono int16 samples at 16 kHz | [`read_wav`](server.py#L127) (stdlib); Whisper + FFmpeg for non-WAV formats |
 | **VAD** | Identify speech regions, prepare for chunking | [`energy_vad`](server.py#L141) — RMS thresholding per 20 ms frame |
-| **ASR** | Speech → text with confidence and timestamps | [`vosk_transcribe`](server.py#L87) (default) or [`whisper_transcribe`](server.py#L72) |
+| **ASR** | Speech → text with a confidence score | Whisper (inline in [`transcribe`](server.py#L238), via [`get_whisper`](server.py#L72)) if installed, else [`vosk_transcribe`](server.py#L87), else a mock transcript |
 | **Post-Process** | Punctuation, summary, NER, sentiment, topics, action items | [`llm_postprocess`](server.py#L170) — single Claude call with regex fallback |
 
 > Architecture diagrams (`docs/architecture.png`, `docs/sequence.png`) are referenced as placeholders and can be added without changing the source.
@@ -66,19 +66,19 @@ The system was built to demonstrate **engineering decisions, not model training*
 
 The choices below are the substance of this project. Each one is a deliberate tradeoff between accuracy, cost, latency, and operational complexity.
 
-### 1. Vosk as default ASR, Whisper as opt-in
+### 1. Whisper preferred when installed, Vosk as the offline fallback
 
-Whisper is the obvious "best" choice on paper — higher accuracy, multilingual, segment-level timestamps. It is not the obvious choice in production.
+`server.py` checks `WHISPER_AVAILABLE` first: if `openai-whisper` is importable, every request is transcribed with Whisper. Only when Whisper is absent does the code fall through to Vosk (`VOSK_AVAILABLE`, gated on the bundled model directory existing), and only when neither is present does it fall through to a documented mock transcript. This makes Vosk the zero-dependency, always-available baseline — the small bundled model ships in this repo so the service works out of the box — while Whisper is the opt-in accuracy upgrade.
 
-| Concern | Vosk (default) | Whisper (opt-in) |
+| Concern | Vosk (bundled, zero-config) | Whisper (opt-in, `pip install openai-whisper`) |
 |---|---|---|
-| Cold-start | ~3s, 40 MB model | ~15s, 140 MB model + 1.5 GB torch |
-| Inference | CPU, real-time on modest hardware | CPU 5–10× slower; GPU recommended |
+| Cold-start | ~3s, 40 MB model | ~15s, 140 MB model + torch |
+| Inference | CPU, real-time on modest hardware | CPU 5–10x slower; GPU recommended |
 | Dependencies | One pip install | torch + FFmpeg on PATH |
 | Network | None required | None (local model) |
-| Accuracy on clean English | Adequate (~10% WER) | Significantly better (~5% WER) |
+| Accuracy on clean English | Adequate | Higher |
 
-For most short-form audio on consumer hardware, Vosk delivers usable results without making the service depend on a GPU or a 1.5 GB transitive dependency. Whisper is detected at startup and used automatically when available — no config flip required.
+For most short-form audio on consumer hardware, Vosk delivers usable results without making the service depend on a GPU or a large transitive dependency. If Whisper is installed, the pipeline uses it automatically for every request — no config flip required.
 
 ### 2. Single-prompt LLM orchestration
 
@@ -98,14 +98,11 @@ Naive chunking of long audio (splitting on time boundaries) cuts mid-word and de
 
 The current implementation uses energy thresholding for zero-dependency operation. WebRTC VAD or Silero VAD are documented production upgrades — the function signature (`samples, sample_rate → [(start, end), ...]`) is stable, so swaps are mechanical.
 
-### 4. Idempotent retries via deterministic chunk IDs
+### 4. Retrievable results via a stable chunk ID
 
-Every request is assigned a `chunk_id` derived from the filename and a coarse timestamp. The contract is simple:
+Every request is assigned a `chunk_id` (an 8-character hash of the filename and request timestamp) and the full response is appended to an in-memory `HISTORY` list. That ID can be used afterward to re-fetch the exact same result via [`GET /transcribe/{chunk_id}`](server.py#L230), without re-reading or re-parsing anything — useful for a frontend that wants to deep-link to a past transcript or poll a result after the initial call.
 
-- **First call** runs the pipeline and stores the result.
-- **Retry with the same `chunk_id`** returns the cached result via [`GET /transcribe/{chunk_id}`](server.py#L230) — no re-execution, no duplicate side effects, no double billing on the LLM call.
-
-This is the same property cloud providers rely on for safe client retries. It costs nothing to implement and prevents an entire class of "we got charged twice" bugs.
+Note that this is *not* request-level idempotency: each `POST /transcribe` call always re-runs the full pipeline and mints a new `chunk_id` (the hash includes the current timestamp), even for byte-identical uploads. `HISTORY` is also process-local and unbounded in memory — it resets on restart and `GET /history` only surfaces the most recent 20 entries. A production version of this would hash the file content (not the timestamp) for true dedup and back `HISTORY` with persistent storage.
 
 ### 5. Layered fallbacks at every external boundary
 
@@ -124,10 +121,10 @@ No single failure mode produces an HTTP 500. The worst case is a degraded respon
 Each stage exposes a typed function signature. The orchestrator wires them together; it doesn't know what's inside.
 
 ```python
-read_wav(path: str)       -> (samples: List[int], sample_rate: int, duration: float)
-energy_vad(samples, sr)   -> List[Tuple[float, float]]
-vosk_transcribe(samples)  -> (text: str, confidence: float, words: List[Word])
-llm_postprocess(raw_text) -> Dict[str, Any]
+read_wav(path: str)              -> (samples: List[int], sample_rate: int, duration: float)
+energy_vad(samples, sr)          -> List[Tuple[float, float]]
+vosk_transcribe(samples, sr)     -> (text: str, confidence: float, word_count: int)
+llm_postprocess(raw_text: str)   -> Dict[str, Any]
 ```
 
 Replacing energy VAD with Silero, or Vosk with Deepgram, is a single-file change. Nothing upstream or downstream needs to know.
@@ -140,15 +137,16 @@ FastAPI is the transport, not the application. The pipeline functions live as pl
 
 ## Features
 
-- WAV native decode; MP3/M4A/FLAC/OGG via Whisper + FFmpeg
-- Word-level and segment-level timestamps
-- Confidence scoring per response
-- Summary, sentiment, named entities, topics, action items
-- Per-stage latency in every response
-- Idempotent retries via `chunk_id`
-- CORS-enabled REST API with auto-generated OpenAPI docs
-- React frontend with live API and demo modes
-- Offline operation by default (no API keys required)
+- WAV native decode via the stdlib `wave` module; MP3/M4A/FLAC/OGG and other formats via Whisper + FFmpeg when Whisper is installed
+- Energy-based voice activity detection (silence/speech segmentation) with a segment count returned per response
+- Confidence scoring per response (derived from Whisper's average log-probability, or averaged Vosk word confidences)
+- LLM post-processing: cleaned/punctuated transcript, 1-2 sentence summary, sentiment, named entities, action items, and topics — via a single Claude API call, with a deterministic regex-based fallback when `anthropic` isn't installed or no API key is set
+- Per-stage latency (`ingest_ms`, `vad_ms`, `asr_ms`, `postprocess_ms`, `total_ms`) in every response
+- Retrievable results via `chunk_id` (`GET /transcribe/{chunk_id}`) and a rolling history of the last 20 transcripts (`GET /history`)
+- Graceful degradation at every layer: Whisper unavailable falls back to Vosk falls back to a labeled mock transcript; Anthropic unavailable or unconfigured falls back to a regex-based cleanup — the service runs with zero optional dependencies installed
+- CORS-enabled REST API with auto-generated OpenAPI docs at `/docs`
+- React frontend (no build step) with a live API mode and a demo mode using pre-baked mock scenarios
+- Offline operation by default (no API keys required; the bundled Vosk model and stdlib WAV decoding are enough to get real transcripts)
 
 ---
 
@@ -167,10 +165,29 @@ OpenAPI / Swagger UI is auto-generated at `/docs`.
 
 ### Example: transcribe a file
 
+The repo ships `harvard.wav` (a standard Harvard Sentences phonetic test recording) specifically so there's a working example with no extra downloads. With the server running (`python server.py`):
+
 ```bash
 curl -X POST "http://127.0.0.1:8000/transcribe?language=en" \
      -F "file=@harvard.wav"
 ```
+
+Or with Python's `requests`:
+
+```python
+import requests
+
+with open("harvard.wav", "rb") as f:
+    resp = requests.post(
+        "http://127.0.0.1:8000/transcribe",
+        params={"language": "en", "run_vad": True, "run_postprocess": True},
+        files={"file": f},
+    )
+resp.raise_for_status()
+print(resp.json()["clean_text"])
+```
+
+Query parameters on `POST /transcribe` (all optional): `language` (default `"en"`, passed through to Whisper if installed — Vosk's bundled model is English-only regardless), `run_vad` (default `true`, toggles the VAD stage), `run_postprocess` (default `true`, toggles the LLM/regex enrichment stage).
 
 ### Example response
 
@@ -222,6 +239,9 @@ ASR dominates. This is the right shape — the rest of the orchestrator should b
 ```
 audio-to-text/
 ├── README.md                       # This document
+├── LICENSE                         # MIT license
+├── requirements.txt                # Python dependencies (required + optional)
+├── .env.example                    # Template for ANTHROPIC_API_KEY
 ├── server.py                       # FastAPI service — pipeline orchestration
 ├── app.jsx                         # React frontend (Babel-standalone, no build step)
 ├── index.html                      # CDN-loaded React mount point
@@ -236,22 +256,56 @@ Backend, frontend, and model artifacts are intentionally kept at the same level.
 
 ## Installation & Setup
 
+### Backend
+
 ```bash
-pip install fastapi uvicorn vosk numpy python-multipart
+pip install -r requirements.txt
 python server.py
 ```
 
-Service runs at `http://127.0.0.1:8000`. Open `index.html` for the frontend.
+`requirements.txt` includes the always-required packages (`fastapi`, `uvicorn`, `python-multipart`) alongside the optional ones (`openai-whisper`, `vosk`, `numpy`, `anthropic`). Nothing needs to be installed beyond `fastapi`, `uvicorn`, and `python-multipart` for the service to run — `vosk` plus the bundled `vosk-model-small-en-us-0.15/` directory gives real offline transcription once installed, and everything else degrades gracefully per the fallback table above. Startup prints which optional engines were detected:
 
-**Optional upgrades:**
-
-```bash
-pip install openai-whisper          # SOTA ASR; auto-detected at startup
-pip install anthropic               # Real LLM post-processing
-export ANTHROPIC_API_KEY=sk-ant-... # Required if anthropic is installed
+```
+[server] whisper=False vosk=True anthropic=False
 ```
 
-The pipeline detects what's installed and routes accordingly. No configuration changes needed.
+The service listens at `http://127.0.0.1:8000`. Interactive API docs are at `http://127.0.0.1:8000/docs`.
+
+**Optional upgrades**, installable independently and detected automatically at import time — no config flag needed:
+
+```bash
+pip install openai-whisper   # preferred ASR engine when present (see Engineering Decisions, #1)
+pip install anthropic        # enables real LLM post-processing instead of the regex fallback
+```
+
+If `anthropic` is installed, also set `ANTHROPIC_API_KEY` (see Environment Variables below) — without it, `llm_postprocess` falls back to the regex-based cleanup even with the package installed.
+
+### Environment Variables
+
+`server.py` reads exactly one environment variable:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | No | Enables real Claude-based post-processing in `llm_postprocess`. Checked via `os.environ.get("ANTHROPIC_API_KEY")`. If unset (or if `anthropic` isn't installed, or the API call raises), the pipeline falls back to a deterministic regex-based cleanup and returns `sentiment: "neutral"`, empty `named_entities`/`action_items`, and `topics: ["general"]`. |
+
+Copy `.env.example` to `.env` and fill in the value, or export it directly in your shell (`export ANTHROPIC_API_KEY=sk-ant-...` on macOS/Linux, `$env:ANTHROPIC_API_KEY="sk-ant-..."` in PowerShell). `server.py` does not load `.env` files itself (no `python-dotenv` dependency) — either export the variable in your shell/process manager before running `python server.py`, or load it yourself. `GET /health` reports whether the key is currently set via `anthropic_key_set`.
+
+### Running the frontend
+
+The frontend is plain static files — `index.html` loads React 18 and Babel Standalone from CDN `<script>` tags and compiles `app.jsx` in the browser, so there is no `npm install` or build step. Any of the following works:
+
+```bash
+# Simplest: open the file directly
+# (double-click index.html, or)
+start index.html          # Windows
+open index.html           # macOS
+
+# Or serve it so fetch() has a proper origin (recommended, avoids file:// quirks)
+python -m http.server 5500
+# then visit http://127.0.0.1:5500/index.html
+```
+
+The frontend's "Live API" mode calls `http://127.0.0.1:8000` directly (hardcoded as `API_BASE` in `app.jsx`), so the backend must be running first. CORS is wide open (`allow_origins=["*"]`) in `server.py`, so it does not matter which origin serves the static files.
 
 ---
 
@@ -278,7 +332,7 @@ The React frontend is intentionally minimal: file upload, live API mode, demo mo
 - **No single point of failure.** Every external dependency has a documented fallback path.
 - **Replaceable model backends.** Swapping Vosk for Deepgram or Whisper for a GPU-served Whisper-large is a one-function change.
 - **Low orchestration overhead.** Non-ASR stages contribute <2% of total latency. The orchestrator does not get in the way.
-- **Idempotent by construction.** Safe to retry; safe to deduplicate at the queue layer; safe to cache.
+- **Results are addressable, not deduplicated.** Every response gets a `chunk_id` and can be re-fetched via `GET /transcribe/{chunk_id}`, but `POST /transcribe` itself always re-runs the pipeline (see Engineering Decisions, #4) — true request-level dedup would need content-based hashing, which isn't implemented yet.
 - **Self-describing responses.** Every payload includes engine, confidence, segment count, and per-stage latency. Operators don't need a separate dashboard to understand a single request.
 
 ---
@@ -298,8 +352,8 @@ The React frontend is intentionally minimal: file upload, live API mode, demo mo
 
 ## A Note on the Approach
 
-This system is small on purpose. The interesting work in audio transcription is not picking the highest-accuracy model — that decision is increasingly commoditized. The interesting work is the orchestration: how stages compose, how failures propagate, how retries stay safe, how the system behaves when a dependency disappears, and how the response shape stays stable while everything underneath changes.
+This system is small on purpose. The interesting work in audio transcription is not picking the highest-accuracy model — that decision is increasingly commoditized. The interesting work is the orchestration: how stages compose, how failures propagate, how results stay addressable, how the system behaves when a dependency disappears, and how the response shape stays stable while everything underneath changes.
 
-The architecture here treats each stage as a contract, not a class. Models are pluggable. The LLM call is collapsed to one round-trip. Retries are deterministic and free. The web layer is intentionally thin. The frontend negotiates with the API through a single JSON shape and nothing else.
+The architecture here treats each stage as a contract, not a class. Models are pluggable. The LLM call is collapsed to one round-trip. Every result is addressable by `chunk_id`. The web layer is intentionally thin. The frontend negotiates with the API through a single JSON shape and nothing else.
 
 These are the decisions that survive when the underlying models get replaced, the deployment target changes, or the team that wrote it moves on. That's what the system is optimized for.
