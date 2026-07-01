@@ -8,6 +8,11 @@ __pycache__/
 .venv/
 venv/
 .env
+!.env.example
+
+# Node (not currently used by this project — frontend is static/no-build,
+# kept here in case tooling is ever added)
+node_modules/
 
 # Jupyter
 .ipynb_checkpoints/
