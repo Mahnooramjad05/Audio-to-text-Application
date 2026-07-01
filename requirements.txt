@@ -1,0 +1,16 @@
+# Core API server (required)
+fastapi
+uvicorn
+python-multipart  # required by FastAPI to parse multipart/form-data file uploads
+
+# Optional: speech recognition engines
+# server.py auto-detects these at import time via try/except and falls back
+# gracefully (Whisper -> Vosk -> mock transcript) if neither is installed.
+openai-whisper     # optional, preferred ASR engine when installed (higher accuracy, slower)
+vosk               # optional, fallback ASR engine (bundled model ships in this repo)
+numpy              # optional, used by vosk_transcribe() for resampling; falls back to struct-based packing if absent
+
+# Optional: LLM post-processing (summary, sentiment, entities, action items, topics)
+# Falls back to a deterministic regex-based cleanup if not installed or if
+# ANTHROPIC_API_KEY is not set.
+anthropic
